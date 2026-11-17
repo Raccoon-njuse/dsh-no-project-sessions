@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "No-project Sessions",
-    "description": "Create a private working directory for sessions that do not belong to a project, set the default conversation directory on the plugin page, and list them under Recent."
+    "description": "Give a work-without-a-project session its own dated working directory named after the first message, grouped under Recent, with a settings page for the root directory."
   }
 }

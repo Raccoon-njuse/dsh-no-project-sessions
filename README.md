@@ -1,22 +1,73 @@
 # dsh-no-project-sessions
 
-DeepSeek Harness 插件：为不属于任何项目的会话自动创建独立工作目录，并在侧栏以「最近」分区集中展示。
+DeepSeek Harness 插件：让"不在项目中工作"的会话从创建那一刻起就住进自己的独立目录。
 
 ## 功能
 
-- **无项目会话**：把空白会话的项目下拉菜单替换为带「不在项目中工作」选项的版本，不必先选项目或工作区。
-- **可配置的默认对话目录**：在插件详情页设置一次草稿根目录（默认 `~/Documents/dsh`），此后的无项目会话都建在该目录下。设置保存后插件重启，不需要重启整个应用。
-- **自动工作目录**：发送第一条消息时，在 `<草稿根>/<YYYY-MM-DD>/` 下根据消息内容创建可读的目录名；重名时自动追加 `-2`、`-3` 等后缀。
-- **侧栏「最近」分区**：使用 Harness 原生 workspace 分组展示这些会话，并将组头样式调整为与「工作区」同级的分区标题。
-- **无侵入**：复用 Harness 的 workspace、session、slot 与主题 token，不替换宿主组件，也不改写其它插件的 DOM。
+- **无项目会话**：把空白会话的项目下拉菜单替换为带「不在项目中工作」选项的版本，不必先选项目。
+- **可配置的默认对话目录**：在插件页设置一次草稿根目录（默认 `~/Documents/dsh`）。保存后插件重启，不需要重启整个应用。
+- **全部归到「最近」**：只注册一个名为「最近」的工作区，所有无项目会话都归属它，在侧栏里依次排列。
+- **每个会话一个独立目录**：首条消息发出前，会话的**工作目录**被提交到 `<根>/<YYYY-MM-DD>/<目录名>`，名字取自首条消息里的英文。
+- **开头会有一条上下文**：因为工作目录确实变了，DSH 会在第 1 轮第 1 步注入一条 `The working directory changed from … to …`，让模型知道自己在哪个目录。
+- **无侵入**：只用 Harness 的 workspace、slot 与主题 token，不替换宿主组件，也不改写其它插件的 DOM。
+
+## 目录与侧栏
+
+```
+D:\dsh-sessions/              ← 工作区「最近」
+├── 2026-11-17/
+│   ├── hello-world/          ← 首条消息 "hello world"
+│   ├── hello-world-2/        ← 另一会话也发了同样内容
+│   └── new-chat/             ← 纯中文消息提不出英文，回退
+└── 2026-11-18/
+    └── fix-the-login-bug/
+```
+
+侧栏：
+
+```
+最近
+├── Greeting                  ← 会话按顺序排列
+└── 搜索今天的 OpenAI 新闻
+```
+
+两个概念要分开：
+
+| | 值 | 谁维护 |
+| --- | --- | --- |
+| 会话归属（`header.cwd`） | `<根>`，所以归「最近」 | DSH，创建后不可改 |
+| 会话工作目录（`workingDirectory`） | `<根>/<日期>/<消息派生名>` | 本插件，首条消息时提交 |
+
+归属留在根，会话才会全在「最近」里；DSH 判定归属用 `candidateMatches` 的**精确路径相等**，把 header 挪到子目录会让会话掉出该分组。工作目录才是每会话独立的那一层。
 
 ## 环境
 
 - DeepSeek Harness 0.2.2-rc.1 及以上（Desktop / Web），`package.json` 的 `engines.dsh` 声明了范围。
 - Host 半依赖 `@deepseek-ai/schemastery`（DSH 自带，已声明为 peer dependency）。`Config` **必须**是原生 Schemastery 图：DSH 的 `Config.listConfigs` 只认这种，手写的 standard-schema 会被判为 `unsupported`，插件页的配置卡就不会渲染。
 - 插件同时包含 Host 与 Client 两半：
-  - Host：注册 `POST /dsh-no-project/prepare`（原子地预留目录并提交会话工作目录）与 `/dsh-no-project/config`（读写草稿根）。
-  - Client：替换项目下拉菜单（加入「不在项目中工作」）、提供「最近」分区标题样式，并在插件详情页提供「默认对话目录」设置卡。
+  - Host：`POST /dsh-no-project/prepare`（为该会话分配 `<root>/<date>/<n>` 并提交为工作目录）与 `/dsh-no-project/config`（读写草稿根、返回「最近」工作区 id）。
+  - Client：替换项目下拉菜单（加入「不在项目中工作」），在发送前触发目录准备，并在插件页提供「默认对话目录」设置卡。
+
+## 目录名怎么来
+
+取首条消息里的前 6 段 ASCII 字母/数字，转小写、用连字符连接、截到 80 字符；重名时追加 `-2`、`-3`。
+
+| 首条消息 | 目录名 |
+| --- | --- |
+| `hello world` | `hello-world` |
+| `Fix the login bug in auth.js` | `fix-the-login-bug-in-auth` |
+| `帮我修一下这个 bug` | `bug` |
+| `帮我看看这个`（纯中文） | `new-chat` |
+
+也可以不用界面，直接在该插件的 `config` 里写：
+
+```yaml
+- insert:
+    - id: no-project-sessions
+      name: 'dsh-no-project-sessions'
+      config:
+        scratchRoot: 'C:\Notes'   # 留空则用 <home>/Documents/dsh
+```
 
 ## 安装
 
@@ -38,10 +89,10 @@ git clone git@github.com:GoetheDady/dsh-no-project-sessions.git
 1. 直接输入绝对路径，或点「浏览…」用系统目录选择器挑一个。
 2. 点「保存」。插件会把该值写入 profile 里本行的 `config.scratchRoot`，然后重启自己。
 
-保存后新建的无项目会话都落在新目录下的日期子目录里。留空并保存表示恢复内置默认值 `~/Documents/dsh`。
+保存后新建的无项目会话都落在新目录下。留空并保存表示恢复内置默认值 `~/Documents/dsh`。
 
-> 这个值只在插件页设置，不提供运行时随时切换的入口：改一次即长期生效，符合「装一次、此后不改」的用法。
-> 已经建在旧目录下的历史会话不会被迁移，也不再显示在「最近」分区中——磁盘上的文件保持原样。
+> 这个值只在插件页设置，不提供运行时随时切换的入口：改一次即长期生效。
+> 已经建在旧目录下的历史会话不会被迁移。0.4.0 起还会注销旧版遗留的「最近」聚合工作区（只删注册，目录与会话日志保留）。
 
 也可以不用界面，直接在该插件的 `config` 里写：
 
@@ -56,10 +107,13 @@ git clone git@github.com:GoetheDady/dsh-no-project-sessions.git
 ## 开发
 
 ```bash
-npm test
-node --check lib/client.js
 node --check lib/index.js
+node --check lib/client.js
+node tests/host.test.js      # 16 项
+node tests/client.test.js    # 9 项
 ```
+
+> 本机沙箱下 `npm test`（`node --test` 需 spawn 子进程）会以 `spawn EPERM` 失败，这是沙箱边界；逐文件直接跑即可。
 
 ## 验证
 
@@ -72,8 +126,8 @@ node --check lib/index.js
 ## 目录
 
 ```text
-lib/index.js        Host half：workspace 注册、目录预留、草稿根读写路由
-lib/client.js       Client half：项目下拉增强、侧栏「最近」样式、默认目录设置卡
+lib/index.js        Host half：目录分配 + 工作区注册、草稿根读写路由
+lib/client.js       Client half：项目下拉增强、默认目录设置卡
 locale/*.json       插件标题与描述
 cordis.patch.yml    Bundle 入口（含默认 config）
 tests/              Node 内置测试

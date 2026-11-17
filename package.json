@@ -1,8 +1,8 @@
 {
   "name": "dsh-no-project-sessions",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
-  "description": "No-project sessions with automatically created working directories, a configurable draft root, and a native Recent section",
+  "description": "No-project sessions, each working in its own dated folder named from the first message, all grouped under a configurable Recent root",
   "type": "module",
   "main": "lib/index.js",
   "engines": {

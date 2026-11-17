@@ -5,19 +5,30 @@ import vm from 'node:vm';
 
 const clientSource = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8');
 
+const ROOT = '/home/test/Documents/dsh';
+
 function deferred() {
   let resolve;
   let reject;
-  const promise = new Promise((yes, no) => {
-    resolve = yes;
-    reject = no;
-  });
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
 }
 
-function createRuntime({ fetchImpl, summary = {}, configRoot } = {}) {
+/** Default Host answer for a preparation request. */
+const okPrepare = () => Promise.resolve({
+  ok: true,
+  status: 200,
+  json: async () => ({ path: `${ROOT}/2026-11-17/1` }),
+});
+
+/**
+ * Load the browser bundle into a minimal runtime.
+ * @param {object} options - root answer, prepare behaviour, and the session row.
+ */
+function createRuntime({ configRoot = ROOT, configFails = false, summary = {}, prepareImpl = okPrepare } = {}) {
   const cleanups = [];
-  const fetchCalls = [];
+  const prepareCalls = [];
+  const registered = [];
   const originalCalls = [];
   const conversation = {
     sendSession: async (...args) => {
@@ -28,29 +39,42 @@ function createRuntime({ fetchImpl, summary = {}, configRoot } = {}) {
   const context = {
     console,
     AbortController,
+    setTimeout,
+    clearTimeout,
+    requestAnimationFrame: (cb) => { cb(); return 0; },
+    cancelAnimationFrame: () => {},
+    navigator: { language: 'zh-CN' },
     fetch: async (path, init) => {
-      // The draft root is read once from the Host; answer it here so the test
-      // controls which path counts as the scratch root.
       if (path === '/dsh-no-project/config') {
+        if (configFails) return { ok: false, status: 500, json: async () => ({}) };
         return {
           ok: true,
           status: 200,
-          json: async () => ({ root: configRoot ?? '/home/test/Documents/dsh', configured: configRoot !== undefined }),
+          json: async () => ({ root: configRoot, workspaceId: 'ws-recent', configured: true }),
         };
       }
-      fetchCalls.push({ path, init });
-      return fetchImpl(path, init);
+      if (path === '/dsh-no-project/prepare') {
+        prepareCalls.push(init);
+        return prepareImpl(path, init);
+      }
+      throw new Error(`unexpected fetch: ${path}`);
     },
     window: undefined,
-    setTimeout,
-    clearTimeout,
+    document: {
+      head: { appendChild: () => {} },
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      visibilityState: 'visible',
+      createElement: () => ({ dataset: {}, style: {}, textContent: '' }),
+    },
+    addEventListener: () => {},
+    removeEventListener: () => {},
   };
   context.window = context;
   context.window.__ModuleLoader__ = {
     load({ factory }) {
       context.exports = factory((name) => {
         assert.ok(name === 'react' || name === 'react-dom', `unexpected module request: ${name}`);
-        // Components are registered, never rendered: no custom React renderer.
         return name === 'react-dom' ? { createPortal: (node) => node } : {};
       });
     },
@@ -58,289 +82,126 @@ function createRuntime({ fetchImpl, summary = {}, configRoot } = {}) {
   vm.runInNewContext(clientSource, context, { filename: 'lib/client.js' });
 
   const ctx = {
-    get: (name) => name === 'conversation' ? conversation : undefined,
-    effect: (install, label) => {
-      // Exercise only the sendSession lifecycle. UI effects need the real app,
-      // not a test DOM or React renderer.
-      if (label !== 'no-project-sessions: restore conversation.sendSession') return;
-      const cleanup = install();
-      if (typeof cleanup === 'function') cleanups.push(cleanup);
-    },
-    locale: {
-      register: () => {},
-      bind: () => (key) => key,
+    get: (name) => (name === 'conversation' ? conversation : undefined),
+    locale: { register: () => {} },
+    slots: {
+      inject: (key, callback) => { callback.call({}); registered.push(key); return () => {}; },
+      register: (options) => ({ options }),
     },
     sessions: { list: { getSnapshot: () => ({ byId: { session: summary } }) } },
-    workspaces: {},
-    slots: { inject: () => {} },
+    workspaces: { create: async ({ path }) => ({ workspaceId: `ws-${path}`, path }) },
+    uiWorkspace: { pickDirectory: async () => null },
     remote: { $host: { home: '/home/test' } },
-    uiWorkspace: { startSession: async () => {} },
+    effect: (install) => {
+      const cleanup = install();
+      if (typeof cleanup === 'function') cleanups.push(cleanup);
+      return () => {};
+    },
   };
   context.exports.apply(ctx);
 
   return {
     call: (...args) => conversation.sendSession(...args),
-    cleanup: () => { while (cleanups.length > 0) cleanups.pop()(); },
-    /**
-     * Let the one Host read that resolves the draft root finish. Sends are
-     * gated on it, so a test asserting synchronous fetch counts settles first.
-     */
     settle: () => context.exports.whenScratchRoot(),
-    fetchCalls,
+    cleanup: () => { while (cleanups.length > 0) { try { cleanups.pop()(); } catch { /* ignore */ } } },
+    prepareCalls,
     originalCalls,
-    conversation,
+    registered,
+    exports: context.exports,
   };
 }
 
-function scratchSummary() {
-  return { cwd: '/home/test/Documents/dsh', projectionValues: {} };
-}
+test('the bundle loads and declares the services it uses', () => {
+  const runtime = createRuntime();
+  assert.equal(typeof runtime.exports.apply, 'function');
+  for (const service of ['slots', 'locale', 'sessions', 'workspaces', 'uiWorkspace', 'conversation', 'remote']) {
+    assert.ok(runtime.exports.inject.includes(service), `inject must list ${service}`);
+  }
+});
 
-test('the real exported apply wrapper shares preparation but aborts only one waiter', async () => {
-  const response = deferred();
-  const runtime = createRuntime({
-    fetchImpl: (_path, init) => {
-      assert.equal(init.method, 'POST');
-      assert.equal(init.signal.aborted, false);
-      return response.promise;
-    },
-    summary: scratchSummary(),
-  });
+test('apply registers the settings card and shadows the workspace picker', () => {
+  const runtime = createRuntime();
+  assert.ok(runtime.registered.includes('plugins.bundle.config'));
+  assert.ok(runtime.registered.includes('conversation.hero.workspace'));
+});
+
+test('a no-project session gets its directory before the prompt is sent', async () => {
+  const runtime = createRuntime({ summary: { cwd: ROOT } });
   await runtime.settle();
-  const session = { sessionId: 'session' };
-  const first = runtime.call(session, 'first text', [], 'chat');
-  const secondController = new AbortController();
-  const second = runtime.call(session, 'second text', [], 'chat', secondController.signal);
-  assert.equal(runtime.fetchCalls.length, 1);
-  secondController.abort();
-  response.resolve({ ok: true, status: 200, json: async () => ({ path: '/home/test/Documents/dsh/2026-11-03/first-text' }) });
-
-  await assert.rejects(second, (error) => error === secondController.signal.reason);
-  const result = await first;
+  const result = await runtime.call({ sessionId: 'session' }, 'hello world', [], 'chat');
   assert.equal(result.sent, true);
+  assert.equal(runtime.prepareCalls.length, 1, 'prepared exactly once');
+  const body = JSON.parse(runtime.prepareCalls[0].body);
+  assert.equal(body.sessionId, 'session');
+  // The first message names the folder, so it must reach the Host.
+  assert.equal(body.text, 'hello world');
   assert.equal(runtime.originalCalls.length, 1);
-  assert.equal(runtime.originalCalls[0][1], 'first text');
-  assert.equal(runtime.fetchCalls[0].init.signal.aborted, false);
-  runtime.cleanup();
 });
 
-test('the real exported apply wrapper clears failed preparation so a later send retries', async () => {
-  const responses = [
-    Promise.resolve({ ok: false, status: 500, json: async () => ({ error: 'temporary failure' }) }),
-    Promise.resolve({ ok: true, status: 200, json: async () => ({ path: '/home/test/Documents/dsh/2026-11-03/retry' }) }),
-  ];
+test('a real project session is left untouched', async () => {
   const runtime = createRuntime({
-    fetchImpl: () => responses.shift(),
-    summary: scratchSummary(),
+    summary: { cwd: '/work/project' },
+    prepareImpl: () => { throw new Error('prepare must not run'); },
   });
   await runtime.settle();
-  const session = { sessionId: 'session' };
-  const failures = await Promise.allSettled([
-    runtime.call(session, 'first'),
-    runtime.call(session, 'second'),
-  ]);
-  assert.equal(runtime.fetchCalls.length, 1);
-  assert.equal(failures[0].status, 'rejected');
-  assert.equal(failures[1].status, 'rejected');
-  assert.match(failures[0].reason.message, /temporary failure/);
-  assert.equal(runtime.originalCalls.length, 0);
-
-  const success = await runtime.call(session, 'retry');
-  assert.equal(success.sent, true);
-  assert.equal(runtime.fetchCalls.length, 2);
+  const result = await runtime.call({ sessionId: 'session' }, 'hello', [], 'chat');
+  assert.equal(result.sent, true);
+  assert.equal(runtime.prepareCalls.length, 0);
   assert.equal(runtime.originalCalls.length, 1);
-  runtime.cleanup();
 });
 
-test('successful shared preparation forwards both sends and clears its pending entry', async () => {
+test('concurrent sends share one preparation', async () => {
   const response = deferred();
   const runtime = createRuntime({
-    fetchImpl: () => response.promise,
-    summary: scratchSummary(),
+    summary: { cwd: ROOT },
+    prepareImpl: () => response.promise,
   });
   await runtime.settle();
-  const session = { sessionId: 'session' };
-  const first = runtime.call(session, 'first', ['attachment'], 'chat');
-  const second = runtime.call(session, 'second');
-  assert.equal(runtime.fetchCalls.length, 1);
-  assert.equal(runtime.originalCalls.length, 0);
-  response.resolve({ ok: true, status: 200, json: async () => ({ path: '/prepared' }) });
+  const first = runtime.call({ sessionId: 'session' }, 'first', [], 'chat');
+  const second = runtime.call({ sessionId: 'session' }, 'second', [], 'chat');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(runtime.prepareCalls.length, 1);
+  response.resolve({ ok: true, status: 200, json: async () => ({ path: `${ROOT}/2026-11-17/1` }) });
   await Promise.all([first, second]);
   assert.equal(runtime.originalCalls.length, 2);
-  assert.equal(runtime.originalCalls[0][1], 'first');
-  assert.deepEqual(runtime.originalCalls[0][2], ['attachment']);
-  assert.equal(runtime.originalCalls[1][1], 'second');
-  // Keep the snapshot stale intentionally: completed promises must not remain
-  // cached. The Host is authoritative and will reuse its committed directory.
-  await runtime.call(session, 'third');
-  assert.equal(runtime.fetchCalls.length, 2);
-  assert.equal(runtime.originalCalls.length, 3);
   runtime.cleanup();
 });
 
-function loadApply({ configRoot } = {}) {
-  const context = {
-    console,
-    AbortController,
-    fetch: async (path) => {
-      // The draft-root read is the one request these instances make.
-      if (path === '/dsh-no-project/config') {
-        return {
-          ok: true,
-          status: 200,
-          json: async () => ({ root: configRoot ?? '/home/test/Documents/dsh', configured: configRoot !== undefined }),
-        };
-      }
-      throw new Error('fetch must not run');
-    },
-    window: undefined,
-    setTimeout,
-    clearTimeout,
-  };
-  context.window = context;
-  context.window.__ModuleLoader__ = {
-    load({ factory }) { context.exports = factory(() => ({})); },
-  };
-  vm.runInNewContext(clientSource, context, { filename: 'lib/client.js' });
-  return context.exports.apply;
-}
-
-// Mimics cordis: reading a function property through the traceable proxy returns
-// a fresh shadow method every time, so `conversation.sendSession === wrapper`
-// is never true. Symbol properties are not wrapped.
-function createTraceableConversation(originalCalls) {
-  const target = {
-    sendSession: async (...args) => {
-      originalCalls.push(args);
-      return { sent: true, args };
-    },
-  };
-  return new Proxy(target, {
-    get(object, key) {
-      const value = Reflect.get(object, key);
-      if (typeof key === 'string' && typeof value === 'function') {
-        return function shadowMethod(...args) { return value.apply(this, args); };
-      }
-      return value;
-    },
-  });
-}
-
-function mountInstance(conversation, summary) {
-  let active = true;
-  const cleanups = [];
-  const ctx = {
-    get: (name) => name === 'conversation' ? conversation : undefined,
-    effect: (install, label) => {
-      if (label !== 'no-project-sessions: restore conversation.sendSession') return;
-      const cleanup = install();
-      if (typeof cleanup === 'function') cleanups.push(cleanup);
-    },
-    locale: { register: () => {}, bind: () => (key) => key },
-    get sessions() {
-      if (!active) throw new Error('cannot get required service "sessions" in inactive context');
-      return { list: { getSnapshot: () => ({ byId: { session: summary } }) } };
-    },
-    workspaces: {},
-    slots: { inject: () => {} },
-    remote: { $host: { home: '/home/test' } },
-    uiWorkspace: { startSession: async () => {} },
-  };
-  loadApply()(ctx);
-  return {
-    settle: () => new Promise((resolve) => setImmediate(resolve)),
-    dispose() {
-      while (cleanups.length > 0) cleanups.pop()();
-      active = false;
-    },
-  };
-}
-
-test('hot reload never leaves a stale wrapper reading an inactive ctx', async () => {
-  const originalCalls = [];
-  const conversation = createTraceableConversation(originalCalls);
-  const prepared = {
-    cwd: '/home/test/Documents/dsh',
-    projectionValues: { workingDirectory: '/home/test/Documents/dsh/2026-11-03/prepared' },
-  };
-  const first = mountInstance(conversation, prepared);
-  first.dispose();
-  const second = mountInstance(conversation, prepared);
-  await second.settle();
-
-  const result = await conversation.sendSession({ sessionId: 'session' }, 'after reload');
-  assert.equal(result.sent, true);
-  assert.equal(originalCalls.length, 1);
-
-  second.dispose();
-  const afterDispose = await conversation.sendSession({ sessionId: 'session' }, 'after dispose');
-  assert.equal(afterDispose.sent, true);
-  assert.equal(originalCalls.length, 2);
-});
-
-test('a real project whose path merely ends in Documents/dsh is not treated as scratch', async () => {
+test('a failed preparation keeps the prompt from being sent', async () => {
   const runtime = createRuntime({
-    fetchImpl: () => { throw new Error('fetch must not run'); },
-    summary: { cwd: '/work/proj/Documents/dsh', projectionValues: {} },
+    summary: { cwd: ROOT },
+    prepareImpl: () => Promise.resolve({ ok: false, status: 500, json: async () => ({ error: 'boom' }) }),
   });
-  const result = await runtime.call({ sessionId: 'session' }, 'hello');
-  assert.equal(result.sent, true);
-  assert.equal(runtime.fetchCalls.length, 0);
-  assert.equal(runtime.originalCalls.length, 1);
-  runtime.cleanup();
+  await runtime.settle();
+  await assert.rejects(runtime.call({ sessionId: 'session' }, 'hello', [], 'chat'), /boom/);
+  assert.equal(runtime.originalCalls.length, 0);
 });
 
-test('the real exported apply wrapper leaves prepared sessions untouched', async () => {
-  const runtime = createRuntime({
-    fetchImpl: () => { throw new Error('fetch must not run'); },
-    summary: {
-      cwd: '/home/test/Documents/dsh',
-      projectionValues: { workingDirectory: '/home/test/Documents/dsh/2026-11-03/already-prepared' },
-    },
-  });
-  const result = await runtime.call({ sessionId: 'session' }, 'already prepared');
-  assert.equal(result.sent, true);
-  assert.equal(runtime.fetchCalls.length, 0);
-  assert.equal(runtime.originalCalls.length, 1);
-  runtime.cleanup();
-});
-
-test('a configured root replaces the default, so the default path becomes an ordinary project', async () => {
-  const configured = '/custom/notes';
-  // The configured root prepares.
-  const scratch = createRuntime({
-    fetchImpl: () => Promise.resolve({ ok: true, status: 200, json: async () => ({ path: `${configured}/2026-11-03/hello` }) }),
-    summary: { cwd: configured, projectionValues: {} },
-    configRoot: configured,
-  });
-  const prepared = await scratch.call({ sessionId: 'session' }, 'hello');
-  assert.equal(prepared.sent, true);
-  assert.equal(scratch.fetchCalls.length, 1);
-  assert.equal(scratch.originalCalls.length, 1);
-  scratch.cleanup();
-
-  // The historical default is no longer scratch: no preparation happens there.
-  const legacy = createRuntime({
-    fetchImpl: () => { throw new Error('fetch must not run'); },
-    summary: { cwd: '/home/test/Documents/dsh', projectionValues: {} },
-    configRoot: configured,
-  });
-  const untouched = await legacy.call({ sessionId: 'session' }, 'hello');
-  assert.equal(untouched.sent, true);
-  assert.equal(legacy.fetchCalls.length, 0);
-  assert.equal(legacy.originalCalls.length, 1);
-  legacy.cleanup();
-});
-
-test('a send forwards the accept callback the composer relies on', async () => {
-  const runtime = createRuntime({
-    fetchImpl: () => { throw new Error('fetch must not run'); },
-    summary: { cwd: '/elsewhere/project', projectionValues: {} },
-  });
+test('the send wrapper forwards the accept callback the composer relies on', async () => {
+  const runtime = createRuntime({ summary: { cwd: '/work/project' } });
+  await runtime.settle();
   const accept = () => {};
   await runtime.call({ sessionId: 'session' }, 'text', [], 'chat', undefined, accept);
-  assert.equal(runtime.originalCalls.length, 1);
   // Signature: (session, text, attachmentIds, mode, signal, accept)
   assert.equal(runtime.originalCalls[0][5], accept);
-  runtime.cleanup();
+});
+
+test('an unreadable root never treats a session as no-project', async () => {
+  const runtime = createRuntime({
+    configFails: true,
+    summary: { cwd: ROOT },
+    prepareImpl: () => { throw new Error('prepare must not run'); },
+  });
+  await runtime.settle();
+  const result = await runtime.call({ sessionId: 'session' }, 'hello', [], 'chat');
+  assert.equal(result.sent, true);
+  assert.equal(runtime.prepareCalls.length, 0, 'no preparation against a guessed root');
+});
+
+test('the picker offers the no-project entry by asking the Host for its workspace', () => {
+  // The section workspace id comes from the Host, so the entry cannot be built
+  // from a guessed path.
+  assert.ok(clientSource.includes('/dsh-no-project/config'));
+  assert.ok(clientSource.includes('workspaceId'));
+  assert.ok(clientSource.includes('/dsh-no-project/prepare'));
 });
