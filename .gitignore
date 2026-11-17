@@ -3,3 +3,4 @@ node_modules/
 *.log
 .tmp-inspect/
 preview-recent-section.png
+*.tgz
