@@ -1,10 +1,13 @@
 {
   "name": "dsh-no-project-sessions",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
-  "description": "No-project sessions with automatically created working directories and a native Recent section",
+  "description": "No-project sessions with automatically created working directories, a configurable draft root, and a native Recent section",
   "type": "module",
   "main": "lib/index.js",
+  "engines": {
+    "dsh": ">=0.2.2-rc.1 <0.3.0"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/GoetheDady/dsh-no-project-sessions.git"
@@ -23,11 +26,20 @@
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
+  },
   "files": [
     "lib/index.js",
     "lib/client.js",
     "cordis.patch.yml",
     "locale/*.json",
+    "docs",
     "icon.svg"
   ],
   "dsh": {
@@ -38,7 +50,8 @@
       "platform": "web",
       "inject": [
         "@deepseek-ai/dsh-client-ui-conversation",
-        "@deepseek-ai/dsh-client-ui-workspace"
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
       ]
     }
   }

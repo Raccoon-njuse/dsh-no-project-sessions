@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, readdir, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import test from 'node:test';
-import { apply, directoryNameFromMessage, reserveDirectory } from '../lib/index.js';
+import { apply, directoryNameFromMessage, reserveDirectory, resolveScratchRoot } from '../lib/index.js';
 
 function deferred() {
   let resolve;
@@ -16,7 +16,7 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-async function fixture(t, { set, rejection } = {}) {
+async function fixture(t, { set, rejection, config } = {}) {
   const tempParent = resolve(tmpdir());
   const root = await mkdtemp(join(tempParent, 'dsh-no-project-test-'));
   t.after(async () => {
@@ -29,11 +29,13 @@ async function fixture(t, { set, rejection } = {}) {
   });
 
   let registration;
+  const registrations = new Map();
   const agents = new Map();
   const paths = new Map();
   const commits = [];
   const warnings = [];
   const workspaces = [];
+  const edits = [];
   const ctx = {
     workspaceRegistry: {
       resolveByPath: async () => undefined,
@@ -57,11 +59,26 @@ async function fixture(t, { set, rejection } = {}) {
     connection: { requestRejection: () => rejection },
     logger: { warn: (message) => warnings.push(message) },
     effect: (install) => install(),
-    webServer: { register: (route) => { registration = route; return () => {}; } },
+    webServer: {
+      register: (route) => {
+        registrations.set(route.path, route);
+        registration = route;
+        return () => {};
+      },
+    },
+    get: (name) => (name === 'configEditor' ? editor : undefined),
+    fiber: { entry: { id: 'no-project-sessions' } },
   };
-  await apply(ctx, { root });
+  const editor = {
+    edit: async (entry, change) => {
+      edits.push(change({ ...(config ?? {}) }, {}));
+    },
+  };
+  await apply(ctx, { root, ...(config === undefined ? {} : { scratchRoot: config.scratchRoot, root }) });
+  registration = registrations.get('/dsh-no-project/prepare');
   assert.equal(registration.kind, 'exact');
   assert.equal(registration.path, '/dsh-no-project/prepare');
+  assert.equal(registrations.get('/dsh-no-project/config').path, '/dsh-no-project/config');
   assert.equal(workspaces[0].title, '最近');
   assert.equal(workspaces[0].path, root);
 
@@ -71,7 +88,7 @@ async function fixture(t, { set, rejection } = {}) {
     return agent;
   }
 
-  async function request(body = {}, { method = 'POST', raw } = {}) {
+  async function send(route, body = {}, { method = 'POST', raw } = {}) {
     const req = Readable.from([Buffer.from(raw ?? JSON.stringify(body))]);
     req.method = method;
     const headers = {};
@@ -81,14 +98,17 @@ async function fixture(t, { set, rejection } = {}) {
       setHeader: (key, value) => { headers[key] = value; },
       end: (value) => { responseBody = value; },
     };
-    await registration.handler(req, res);
+    await route.handler(req, res);
     return {
       status: res.statusCode,
       headers,
       body: responseBody === undefined ? undefined : JSON.parse(responseBody),
     };
   }
-  return { root, addSession, request, commits, paths, warnings };
+
+  const request = (body, options) => send(registration, body, options);
+  const configRequest = (body, options) => send(registrations.get('/dsh-no-project/config'), body, options);
+  return { root, addSession, request, configRequest, commits, paths, warnings, edits };
 }
 
 test('directory names use six ASCII groups and a safe fallback', () => {
@@ -204,4 +224,111 @@ test('route rejects unauthenticated, wrong-method, unready and real-project requ
   assert.equal((await f.request({}, { raw: 'x'.repeat(64 * 1024 + 1) })).status, 500);
   assert.equal(f.commits.length, 0);
   assert.deepEqual(await readdir(f.root), []);
+});
+
+test('Config is a native Schemastery schema and passes the activation resolver', async () => {
+  const { Config } = await import('../lib/index.js');
+  // DSH's Config projection accepts only a native Schemastery graph; anything
+  // else reports `status: 'unsupported'` and hides the bundle's config card.
+  // `isNativeConfigSchema` checks exactly these three things.
+  assert.equal(Reflect.get(Config, Symbol.for('schemastery')), true);
+  assert.equal(typeof Reflect.get(Config, 'type'), 'string');
+  const meta = Reflect.get(Config, 'meta');
+  assert.ok(meta !== null && typeof meta === 'object');
+  // The declared field is what the settings page reads and writes.
+  assert.ok(Object.hasOwn(Config.dict, 'scratchRoot'));
+
+  // Cordis resolves a plugin's Config through `Config['~standard'].validate`;
+  // a throwing, absent, or async validator would break activation.
+  const validate = (value) => {
+    const result = Config['~standard'].validate(value);
+    assert.equal('then' in result, false, 'config validation must be synchronous');
+    if (result.issues) throw new Error(JSON.stringify(result.issues));
+    return result.value;
+  };
+  assert.deepEqual(validate({}), { scratchRoot: '' });
+  assert.deepEqual(validate({ scratchRoot: 'C:/Notes' }), { scratchRoot: 'C:/Notes' });
+  assert.throws(() => validate({ scratchRoot: 5 }), /scratchRoot/);
+});
+
+test('resolveScratchRoot honors absolute, relative and empty values', () => {
+  const home = homedir();
+  assert.equal(resolveScratchRoot(undefined), join(home, 'Documents', 'dsh'));
+  assert.equal(resolveScratchRoot('   '), join(home, 'Documents', 'dsh'));
+  assert.equal(resolveScratchRoot(''), join(home, 'Documents', 'dsh'));
+  const absolute = resolve(tmpdir(), 'nps-absolute-root');
+  assert.equal(resolveScratchRoot(absolute), absolute);
+  assert.equal(resolveScratchRoot('Notes'), resolve(home, 'Notes'));
+  assert.equal(resolveScratchRoot('  Notes  '), resolve(home, 'Notes'));
+});
+
+test('the config route reports the effective root and saves a new one once', async (t) => {
+  const f = await fixture(t);
+  const initial = await f.configRequest({}, { method: 'GET' });
+  assert.equal(initial.status, 200);
+  assert.equal(initial.body.root, f.root);
+  assert.equal(initial.body.configured, false);
+
+  const target = await mkdtemp(join(resolve(tmpdir()), 'dsh-no-project-target-'));
+  t.after(async () => { await rm(resolve(target), { recursive: true, force: true }); });
+
+  const saved = await f.configRequest({ root: target });
+  assert.equal(saved.status, 200);
+  assert.equal(saved.body.root, resolve(target));
+  assert.equal(saved.body.restart, true);
+  // The write replaces the row's whole config, dropping any previous value.
+  assert.deepEqual(f.edits, [{ scratchRoot: resolve(target) }]);
+
+  // Only GET and POST are served.
+  const wrongMethod = await f.configRequest({}, { method: 'DELETE' });
+  assert.equal(wrongMethod.status, 405);
+  assert.equal(wrongMethod.headers.allow, 'GET, POST');
+
+  // Authentication applies to this route exactly as it does to prepare.
+  const denied = await fixture(t, { rejection: 401 });
+  assert.equal((await denied.configRequest({}, { method: 'GET' })).status, 401);
+  assert.equal((await denied.configRequest({ root: target })).status, 401);
+  assert.deepEqual(denied.edits, []);
+});
+
+test('an empty saved root clears the field so the built-in default applies', async (t) => {
+  const f = await fixture(t);
+  const cleared = await f.configRequest({ root: '   ' });
+  assert.equal(cleared.status, 200);
+  assert.deepEqual(f.edits, [{}]);
+  assert.equal(cleared.body.root, join(homedir(), 'Documents', 'dsh'));
+});
+
+test('a profile without a config editor refuses the write instead of claiming success', async (t) => {
+  const root = await mkdtemp(join(resolve(tmpdir()), 'dsh-no-project-test-'));
+  t.after(async () => { await rm(resolve(root), { recursive: true, force: true }); });
+  const registrations = new Map();
+  const ctx = {
+    workspaceRegistry: {
+      resolveByPath: async () => undefined,
+      create: async (path, title) => ({ id: 'scratch', path, title }),
+      list: () => [],
+      insertBefore: async () => {},
+    },
+    agents: { get: () => undefined },
+    workingDirectory: { get: () => root, set: async () => {} },
+    connection: { requestRejection: () => undefined },
+    logger: { warn: () => {} },
+    effect: (install) => install(),
+    webServer: { register: (route) => { registrations.set(route.path, route); return () => {}; } },
+    // Deliberately no `get('configEditor')`: the entry cannot be written here.
+    get: () => undefined,
+  };
+  await apply(ctx, { root });
+  const req = Readable.from([Buffer.from(JSON.stringify({ root: join(root, 'elsewhere') }))]);
+  req.method = 'POST';
+  let responseBody;
+  const res = {
+    statusCode: 0,
+    setHeader: () => {},
+    end: (value) => { responseBody = value; },
+  };
+  await registrations.get('/dsh-no-project/config').handler(req, res);
+  assert.equal(res.statusCode, 501);
+  assert.match(JSON.parse(responseBody).error, /无法保存/);
 });

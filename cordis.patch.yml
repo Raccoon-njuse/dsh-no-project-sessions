@@ -1,3 +1,7 @@
 - insert:
     - id: no-project-sessions
       name: 'dsh-no-project-sessions'
+      # `scratchRoot` is written by the bundle's own settings page in Plugins.
+      # An empty value keeps the built-in default: <home>/Documents/dsh.
+      config:
+        scratchRoot: ''

@@ -15,7 +15,7 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function createRuntime({ fetchImpl, summary = {} } = {}) {
+function createRuntime({ fetchImpl, summary = {}, configRoot } = {}) {
   const cleanups = [];
   const fetchCalls = [];
   const originalCalls = [];
@@ -29,6 +29,15 @@ function createRuntime({ fetchImpl, summary = {} } = {}) {
     console,
     AbortController,
     fetch: async (path, init) => {
+      // The draft root is read once from the Host; answer it here so the test
+      // controls which path counts as the scratch root.
+      if (path === '/dsh-no-project/config') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ root: configRoot ?? '/home/test/Documents/dsh', configured: configRoot !== undefined }),
+        };
+      }
       fetchCalls.push({ path, init });
       return fetchImpl(path, init);
     },
@@ -40,9 +49,9 @@ function createRuntime({ fetchImpl, summary = {} } = {}) {
   context.window.__ModuleLoader__ = {
     load({ factory }) {
       context.exports = factory((name) => {
-        assert.equal(name, 'react');
+        assert.ok(name === 'react' || name === 'react-dom', `unexpected module request: ${name}`);
         // Components are registered, never rendered: no custom React renderer.
-        return {};
+        return name === 'react-dom' ? { createPortal: (node) => node } : {};
       });
     },
   };
@@ -72,6 +81,11 @@ function createRuntime({ fetchImpl, summary = {} } = {}) {
   return {
     call: (...args) => conversation.sendSession(...args),
     cleanup: () => { while (cleanups.length > 0) cleanups.pop()(); },
+    /**
+     * Let the one Host read that resolves the draft root finish. Sends are
+     * gated on it, so a test asserting synchronous fetch counts settles first.
+     */
+    settle: () => context.exports.whenScratchRoot(),
     fetchCalls,
     originalCalls,
     conversation,
@@ -92,6 +106,7 @@ test('the real exported apply wrapper shares preparation but aborts only one wai
     },
     summary: scratchSummary(),
   });
+  await runtime.settle();
   const session = { sessionId: 'session' };
   const first = runtime.call(session, 'first text', [], 'chat');
   const secondController = new AbortController();
@@ -118,6 +133,7 @@ test('the real exported apply wrapper clears failed preparation so a later send 
     fetchImpl: () => responses.shift(),
     summary: scratchSummary(),
   });
+  await runtime.settle();
   const session = { sessionId: 'session' };
   const failures = await Promise.allSettled([
     runtime.call(session, 'first'),
@@ -142,6 +158,7 @@ test('successful shared preparation forwards both sends and clears its pending e
     fetchImpl: () => response.promise,
     summary: scratchSummary(),
   });
+  await runtime.settle();
   const session = { sessionId: 'session' };
   const first = runtime.call(session, 'first', ['attachment'], 'chat');
   const second = runtime.call(session, 'second');
@@ -161,11 +178,21 @@ test('successful shared preparation forwards both sends and clears its pending e
   runtime.cleanup();
 });
 
-function loadApply() {
+function loadApply({ configRoot } = {}) {
   const context = {
     console,
     AbortController,
-    fetch: async () => { throw new Error('fetch must not run'); },
+    fetch: async (path) => {
+      // The draft-root read is the one request these instances make.
+      if (path === '/dsh-no-project/config') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ root: configRoot ?? '/home/test/Documents/dsh', configured: configRoot !== undefined }),
+        };
+      }
+      throw new Error('fetch must not run');
+    },
     window: undefined,
     setTimeout,
     clearTimeout,
@@ -221,6 +248,7 @@ function mountInstance(conversation, summary) {
   };
   loadApply()(ctx);
   return {
+    settle: () => new Promise((resolve) => setImmediate(resolve)),
     dispose() {
       while (cleanups.length > 0) cleanups.pop()();
       active = false;
@@ -238,6 +266,7 @@ test('hot reload never leaves a stale wrapper reading an inactive ctx', async ()
   const first = mountInstance(conversation, prepared);
   first.dispose();
   const second = mountInstance(conversation, prepared);
+  await second.settle();
 
   const result = await conversation.sendSession({ sessionId: 'session' }, 'after reload');
   assert.equal(result.sent, true);
@@ -273,5 +302,45 @@ test('the real exported apply wrapper leaves prepared sessions untouched', async
   assert.equal(result.sent, true);
   assert.equal(runtime.fetchCalls.length, 0);
   assert.equal(runtime.originalCalls.length, 1);
+  runtime.cleanup();
+});
+
+test('a configured root replaces the default, so the default path becomes an ordinary project', async () => {
+  const configured = '/custom/notes';
+  // The configured root prepares.
+  const scratch = createRuntime({
+    fetchImpl: () => Promise.resolve({ ok: true, status: 200, json: async () => ({ path: `${configured}/2026-11-03/hello` }) }),
+    summary: { cwd: configured, projectionValues: {} },
+    configRoot: configured,
+  });
+  const prepared = await scratch.call({ sessionId: 'session' }, 'hello');
+  assert.equal(prepared.sent, true);
+  assert.equal(scratch.fetchCalls.length, 1);
+  assert.equal(scratch.originalCalls.length, 1);
+  scratch.cleanup();
+
+  // The historical default is no longer scratch: no preparation happens there.
+  const legacy = createRuntime({
+    fetchImpl: () => { throw new Error('fetch must not run'); },
+    summary: { cwd: '/home/test/Documents/dsh', projectionValues: {} },
+    configRoot: configured,
+  });
+  const untouched = await legacy.call({ sessionId: 'session' }, 'hello');
+  assert.equal(untouched.sent, true);
+  assert.equal(legacy.fetchCalls.length, 0);
+  assert.equal(legacy.originalCalls.length, 1);
+  legacy.cleanup();
+});
+
+test('a send forwards the accept callback the composer relies on', async () => {
+  const runtime = createRuntime({
+    fetchImpl: () => { throw new Error('fetch must not run'); },
+    summary: { cwd: '/elsewhere/project', projectionValues: {} },
+  });
+  const accept = () => {};
+  await runtime.call({ sessionId: 'session' }, 'text', [], 'chat', undefined, accept);
+  assert.equal(runtime.originalCalls.length, 1);
+  // Signature: (session, text, attachmentIds, mode, signal, accept)
+  assert.equal(runtime.originalCalls[0][5], accept);
   runtime.cleanup();
 });
