@@ -25,7 +25,7 @@ const okPrepare = () => Promise.resolve({
  * Load the browser bundle into a minimal runtime.
  * @param {object} options - root answer, prepare behaviour, and the session row.
  */
-function createRuntime({ configRoot = ROOT, configFails = false, summary = {}, prepareImpl = okPrepare } = {}) {
+function createRuntime({ configRoot = ROOT, configFails = false, summary = {}, prepareImpl = okPrepare, onStyle } = {}) {
   const cleanups = [];
   const prepareCalls = [];
   const registered = [];
@@ -61,11 +61,19 @@ function createRuntime({ configRoot = ROOT, configFails = false, summary = {}, p
     },
     window: undefined,
     document: {
-      head: { appendChild: () => {} },
+      head: {
+        appendChild: (el) => { if (typeof onStyle === 'function') onStyle(el); },
+      },
       addEventListener: () => {},
       removeEventListener: () => {},
       visibilityState: 'visible',
-      createElement: () => ({ dataset: {}, style: {}, textContent: '' }),
+      createElement: () => ({
+        dataset: {},
+        style: {},
+        textContent: '',
+        removed: false,
+        remove() { this.removed = true; },
+      }),
     },
     addEventListener: () => {},
     removeEventListener: () => {},
@@ -83,8 +91,7 @@ function createRuntime({ configRoot = ROOT, configFails = false, summary = {}, p
 
   const ctx = {
     get: (name) => (name === 'conversation' ? conversation : undefined),
-    locale: { register: () => {} },
-    slots: {
+    locale: { register: () => {} },    slots: {
       inject: (key, callback) => { callback.call({}); registered.push(key); return () => {}; },
       register: (options) => ({ options }),
     },
@@ -196,6 +203,38 @@ test('an unreadable root never treats a session as no-project', async () => {
   const result = await runtime.call({ sessionId: 'session' }, 'hello', [], 'chat');
   assert.equal(result.sent, true);
   assert.equal(runtime.prepareCalls.length, 0, 'no preparation against a guessed root');
+});
+
+test('the "最近" row is restyled as a section heading, not a project row', async () => {
+  // This Host has no Slot for a Workspace group header, so the row is restyled in
+  // place: the folder glyph and the chevron must be hidden and the row must not
+  // paint a hover background. The selector keys on the section's workspace id, so
+  // it can never reach a real project.
+  const styles = [];
+  const runtime = createRuntime({ onStyle: (el) => styles.push(el) });
+  await runtime.settle();
+
+  const rowRule = styles
+    .map(el => el.textContent)
+    .find(text => text.includes('data-row-key="workspace:ws-recent"'));
+  assert.ok(rowRule, 'a rule must target the section row by workspace id');
+  // The two leading spans are the glyph and the chevron; the third is the title.
+  assert.match(rowRule, /span:nth-child\(1\)[\s\S]*display: none/);
+  assert.match(rowRule, /span:nth-child\(2\)[\s\S]*display: none/);
+  // The title itself must never be hidden.
+  assert.doesNotMatch(rowRule, /nth-child\(3\)[\s\S]*display: none/);
+  // Muted, section-like presentation.
+  assert.match(rowRule, /--dsw-alias-label-secondary/);
+  assert.match(rowRule, /background: transparent/);
+});
+
+test('the section style is removed when the plugin unloads', async () => {
+  const styles = [];
+  const runtime = createRuntime({ onStyle: (el) => styles.push(el) });
+  await runtime.settle();
+  assert.ok(styles.length > 0);
+  runtime.cleanup();
+  assert.ok(styles.some(el => el.removed === true), 'the injected style must be removable');
 });
 
 test('the picker offers the no-project entry by asking the Host for its workspace', () => {
